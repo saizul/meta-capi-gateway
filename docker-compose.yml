@@ -1,0 +1,19 @@
+services:
+  capi-gateway:
+    build: .
+    image: meta-capi-gateway:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bind to localhost and put a TLS-terminating reverse proxy (Caddy/nginx) in front.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - capi-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  capi-data:
