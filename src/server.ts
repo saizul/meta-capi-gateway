@@ -6,6 +6,8 @@ import type { Logger } from "./logger.js";
 import type { EventSink } from "./queue.js";
 import type { RateLimiter } from "./ratelimit.js";
 import { extractEvents, validateEvent } from "./schema.js";
+import { SHOPIFY_ORDER_TOPICS, shopifyOrderToPurchase, verifyShopifySignature } from "./shopify.js";
+import type { ShopifyOptions, ShopifyOrder } from "./shopify.js";
 import { SNIPPET } from "./snippet.js";
 import type { ServerEvent, ValidEvent } from "./types.js";
 import { SeenOrders, orderToPurchase, verifyWooSignature } from "./woocommerce.js";
@@ -67,6 +69,11 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+function header(req: IncomingMessage, name: string): string | undefined {
+  const v = req.headers[name];
+  return Array.isArray(v) ? v[0] : v;
 }
 
 function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -214,6 +221,63 @@ export function createHandler(deps: AppDeps): (req: IncomingMessage, res: Server
     send(res, 202, { accepted: 1, event_id: result.event.event_id });
   }
 
+  async function shopify(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!config.shopifySecret) {
+      send(res, 404, { error: "not_found" });
+      return;
+    }
+    if (req.method !== "POST") {
+      send(res, 405, { error: "method_not_allowed" }, { allow: "POST" });
+      return;
+    }
+    const raw = await readBody(req, Math.max(config.maxBodyBytes, 1_048_576));
+    if (!verifyShopifySignature(raw, header(req, "x-shopify-hmac-sha256"), config.shopifySecret)) {
+      logger.warn("shopify signature rejected");
+      send(res, 401, { error: "invalid_signature" });
+      return;
+    }
+    // Shopify retries anything that is not 2xx, so unsupported topics are acknowledged, not rejected.
+    const topic = header(req, "x-shopify-topic")?.trim().toLowerCase();
+    if (topic && !SHOPIFY_ORDER_TOPICS.includes(topic)) {
+      send(res, 200, { ok: true, ignored: "topic" });
+      return;
+    }
+    let order: ShopifyOrder;
+    try {
+      order = JSON.parse(raw.toString("utf8")) as ShopifyOrder;
+      if (typeof order !== "object" || order === null || Array.isArray(order)) throw new Error("not an object");
+    } catch {
+      send(res, 400, { error: "invalid_json" });
+      return;
+    }
+    const opts: ShopifyOptions = {
+      defaultCountryCode: config.defaultPhoneCountryCode,
+      acceptedStatuses: config.shopifyFinancialStatuses,
+      includeTestOrders: config.shopifyIncludeTestOrders,
+    };
+    if (config.siteUrl) opts.siteUrl = config.siteUrl;
+    const shop = header(req, "x-shopify-shop-domain");
+    if (shop) opts.shopDomain = shop.trim();
+    if (deps.now) opts.nowSec = Math.floor(deps.now() / 1000);
+    const result = shopifyOrderToPurchase(order, opts);
+    if (!result.ok) {
+      send(res, result.reason === "invalid_order" ? 400 : 200, { ok: result.reason !== "invalid_order", ignored: result.reason });
+      return;
+    }
+    // orders/create, orders/paid and orders/updated all describe the same order: forward it once.
+    const key = "shopify:" + result.event.custom_data!.order_id!;
+    if (seen.has(key)) {
+      send(res, 200, { ok: true, ignored: "duplicate", event_id: result.event.event_id });
+      return;
+    }
+    if (!queue.add([result.event])) {
+      send(res, 503, { error: "queue_full" }, { "retry-after": "5" });
+      return;
+    }
+    seen.add(key);
+    send(res, 202, { accepted: 1, event_id: result.event.event_id });
+  }
+
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
     if (path === "/health" && (req.method === "GET" || req.method === "HEAD")) {
@@ -237,6 +301,7 @@ export function createHandler(deps: AppDeps): (req: IncomingMessage, res: Server
     }
     if (path === "/events") return events(req, res);
     if (path === "/webhooks/woocommerce") return woo(req, res);
+    if (path === "/webhooks/shopify") return shopify(req, res);
     send(res, 404, { error: "not_found" });
   }
 

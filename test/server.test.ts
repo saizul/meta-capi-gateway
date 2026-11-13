@@ -9,6 +9,7 @@ import { RateLimiter } from "../src/ratelimit.js";
 import { clientIp, createHandler } from "../src/server.js";
 import { sha256 } from "../src/hash.js";
 import type { ServerEvent } from "../src/types.js";
+import { computeShopifySignature } from "../src/shopify.js";
 import { computeWooSignature } from "../src/woocommerce.js";
 
 const ORIGIN = "https://shop.example.com";
@@ -26,6 +27,7 @@ async function start(env: Record<string, string> = {}, limit = 100) {
     ACCESS_TOKEN: "tok",
     ALLOWED_ORIGINS: `${ORIGIN},https://*.partner.test`,
     WOOCOMMERCE_WEBHOOK_SECRET: "whsec",
+    SHOPIFY_WEBHOOK_SECRET: "shpsec",
     SITE_URL: "https://shop.example.com",
     ...env,
   });
@@ -288,5 +290,113 @@ describe("POST /webhooks/woocommerce", () => {
   });
   it("405 for GET", async () => {
     expect((await fetch(base + "/webhooks/woocommerce")).status).toBe(405);
+  });
+});
+
+describe("POST /webhooks/shopify", () => {
+  const order = {
+    id: 820982911946154500,
+    currency: "BDT",
+    total_price: "1500.00",
+    financial_status: "paid",
+    processed_at: "2026-03-10T11:00:00Z",
+    email: "buyer@example.com",
+    billing_address: { phone: "01812345678", country_code: "BD" },
+    line_items: [{ product_id: 5, variant_id: 50, quantity: 1, price: "1500.00" }],
+  };
+  const hook = (body: string, sig?: string, headers: Record<string, string> = {}) =>
+    fetch(base + "/webhooks/shopify", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-shopify-topic": "orders/paid",
+        "x-shopify-shop-domain": "demo-store.myshopify.com",
+        ...(sig === undefined ? {} : { "x-shopify-hmac-sha256": sig }),
+        ...headers,
+      },
+      body,
+    });
+  const signed = (o: unknown, headers: Record<string, string> = {}) => {
+    const body = JSON.stringify(o);
+    return hook(body, computeShopifySignature(body, "shpsec"), headers);
+  };
+
+  it("accepts a correctly signed paid order and queues a Purchase", async () => {
+    const r = await signed(order);
+    expect(r.status).toBe(202);
+    expect(await r.json()).toMatchObject({ accepted: 1, event_id: "shopify_order_820982911946154500" });
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).toMatchObject({ event_name: "Purchase", event_source_url: "https://shop.example.com/checkout/" });
+    expect(captured[0]?.custom_data).toMatchObject({ value: 1500, currency: "BDT", content_ids: ["50"] });
+    expect(captured[0]?.user_data.em).toEqual([sha256("buyer@example.com")]);
+  });
+  it("401 on a bad or missing signature", async () => {
+    const body = JSON.stringify(order);
+    expect((await hook(body, computeShopifySignature(body, "wrong"))).status).toBe(401);
+    expect((await hook(body)).status).toBe(401);
+    expect((await hook(body, computeWooSignature(body, "whsec"))).status).toBe(401);
+    expect(captured).toHaveLength(0);
+  });
+  it("acknowledges non-order topics without queuing", async () => {
+    const r = await signed({ id: 1 }, { "x-shopify-topic": "products/update" });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toMatchObject({ ignored: "topic" });
+    expect(captured).toHaveLength(0);
+  });
+  it("200 ignored for unpaid, cancelled and test orders", async () => {
+    for (const [o, reason] of [
+      [{ ...order, financial_status: "pending" }, "not_paid"],
+      [{ ...order, cancelled_at: "2026-03-10T11:30:00Z" }, "cancelled"],
+      [{ ...order, test: true }, "test_order"],
+    ] as const) {
+      const r = await signed(o, { "x-shopify-topic": "orders/create" });
+      expect(r.status).toBe(200);
+      expect(await r.json()).toMatchObject({ ignored: reason });
+    }
+    expect(captured).toHaveLength(0);
+  });
+  it("forwards each order once across orders/create, orders/paid and retries", async () => {
+    expect((await signed(order, { "x-shopify-topic": "orders/create" })).status).toBe(202);
+    const r = await signed(order, { "x-shopify-topic": "orders/paid" });
+    expect(await r.json()).toMatchObject({ ignored: "duplicate" });
+    expect(captured).toHaveLength(1);
+  });
+  it("does not collide with a WooCommerce order using the same id", async () => {
+    const woo = { id: 77, status: "completed", currency: "BDT", total: "10", date_paid_gmt: "2026-03-10T11:00:00" };
+    const wooBody = JSON.stringify(woo);
+    await fetch(base + "/webhooks/woocommerce", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wc-webhook-signature": computeWooSignature(wooBody, "whsec") },
+      body: wooBody,
+    });
+    expect((await signed({ ...order, id: 77 })).status).toBe(202);
+    expect(captured.map((e) => e.event_id)).toEqual(["wc_order_77", "shopify_order_77"]);
+  });
+  it("honours SHOPIFY_FINANCIAL_STATUSES for cash-on-delivery stores", async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    await start({ SHOPIFY_FINANCIAL_STATUSES: "paid,pending", SITE_URL: "" });
+    const r = await signed({ ...order, financial_status: "pending" }, { "x-shopify-topic": "orders/create" });
+    expect(r.status).toBe(202);
+    expect(captured[0]?.event_source_url).toBe("https://demo-store.myshopify.com/checkout/");
+  });
+  it("400 for invalid JSON or an order missing required fields", async () => {
+    const bad = "not json";
+    expect((await hook(bad, computeShopifySignature(bad, "shpsec"))).status).toBe(400);
+    expect((await signed([order])).status).toBe(400);
+    expect((await signed({ financial_status: "paid" })).status).toBe(400);
+  });
+  it("503 and not marked seen when the queue is full", async () => {
+    accepting = false;
+    expect((await signed(order)).status).toBe(503);
+    accepting = true;
+    expect((await signed(order)).status).toBe(202);
+  });
+  it("is disabled (404) without a webhook secret", async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    await start({ SHOPIFY_WEBHOOK_SECRET: "" });
+    expect((await hook("{}", "x")).status).toBe(404);
+  });
+  it("405 for GET", async () => {
+    expect((await fetch(base + "/webhooks/shopify")).status).toBe(405);
   });
 });

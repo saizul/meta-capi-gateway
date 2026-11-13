@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Shopify webhook receiver at `POST /webhooks/shopify` with HMAC-SHA256 verification of `X-Shopify-Hmac-Sha256`, mapping `orders/create`, `orders/paid` and `orders/updated` to `Purchase` events with a stable `shopify_order_{id}` event id.
+- `SHOPIFY_WEBHOOK_SECRET`, `SHOPIFY_FINANCIAL_STATUSES` (default `paid`; add `pending` for cash-on-delivery) and `SHOPIFY_INCLUDE_TEST_ORDERS` settings.
+- Cancelled and test orders are skipped, other topics are acknowledged and ignored, and each order is forwarded once per process across topics and retries.
+
 ## [0.1.0] - 2026-11-10
 
 ### Added

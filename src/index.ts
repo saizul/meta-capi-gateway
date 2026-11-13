@@ -37,6 +37,7 @@ server.listen(config.port, config.host, () => {
     graph_api_version: config.graphApiVersion,
     test_mode: Boolean(config.testEventCode),
     woocommerce: Boolean(config.wooSecret),
+    shopify: Boolean(config.shopifySecret),
   });
   if (config.testEventCode) logger.warn("TEST_EVENT_CODE is set: events appear only in Test Events");
   if (config.allowedOrigins.length === 0) logger.warn("ALLOWED_ORIGINS is empty: browser events will be rejected");
