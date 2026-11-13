@@ -1,6 +1,6 @@
 # meta-capi-gateway
 
-A small, self-hostable gateway for the **Meta Conversions API (CAPI)**. Your site sends plain events to the gateway; it validates them, normalizes and SHA-256 hashes customer information the way Meta expects, batches them, and delivers them to the Graph API with retries and a dead-letter file. It also accepts signed WooCommerce webhooks and turns completed orders into server-side `Purchase` events.
+A small, self-hostable gateway for the **Meta Conversions API (CAPI)**. Your site sends plain events to the gateway; it validates them, normalizes and SHA-256 hashes customer information the way Meta expects, batches them, and delivers them to the Graph API with retries and a dead-letter file. It also accepts signed WooCommerce and Shopify webhooks and turns completed or paid orders into server-side `Purchase` events.
 
 - TypeScript, Node.js 22+, **zero runtime dependencies** (`node:http` and global `fetch`)
 - Browser snippet with consent gating and Pixel/server deduplication via a shared `event_id`
@@ -9,13 +9,14 @@ A small, self-hostable gateway for the **Meta Conversions API (CAPI)**. Your sit
 - Batching (up to the API limit), exponential backoff with jitter, `test_event_code` support
 - Dead-letter JSONL file plus a replay command
 - Structured JSON logs that never print raw personal data
-- Docker image, compose file, 290+ tests, CI on Node 22 and 24
+- Docker image, compose file, 330+ tests, CI on Node 22 and 24
 
 Built and maintained by [Saizul Amin](https://saizul.com), Meta Ads and automation specialist.
 
 ```
 Browser (snippet) --POST /events--> gateway --batch--> graph.facebook.com/{version}/{pixel_id}/events
 WooCommerce -------POST /webhooks/woocommerce (HMAC) -->    |
+Shopify -----------POST /webhooks/shopify (HMAC) ------>    |
                                                        dead-letter.jsonl (on permanent failure)
 ```
 
@@ -85,7 +86,10 @@ Responses: `202 {accepted, dropped, event_ids}`, `400` validation details, `403`
 | `DEAD_LETTER_PATH` | `./data/dead-letter.jsonl` | Failed batches |
 | `DEFAULT_PHONE_COUNTRY_CODE` | `880` | Used for numbers without `+` or `00` |
 | `WOOCOMMERCE_WEBHOOK_SECRET` | unset | Enables `/webhooks/woocommerce` |
-| `SITE_URL` | unset | Used as `event_source_url` for WooCommerce orders |
+| `SHOPIFY_WEBHOOK_SECRET` | unset | Enables `/webhooks/shopify` |
+| `SHOPIFY_FINANCIAL_STATUSES` | `paid` | Comma list of Shopify `financial_status` values that count as a purchase |
+| `SHOPIFY_INCLUDE_TEST_ORDERS` | `false` | Forward orders Shopify flags as `test` |
+| `SITE_URL` | unset | Used as `event_source_url` for WooCommerce and Shopify orders |
 | `LOG_LEVEL`, `PORT`, `HOST`, `MAX_BODY_BYTES`, `GRAPH_BASE_URL` | see `.env.example` | |
 
 ## What gets normalized and hashed
@@ -108,7 +112,7 @@ The `ph` rule for numbers without a prefix assumes `DEFAULT_PHONE_COUNTRY_CODE`;
 
 ## Deduplication
 
-Meta deduplicates a browser and a server event when they share the same `event_name` and `event_id` (and arrive within its dedup window). The snippet creates one `event_id` and uses it for both. For WooCommerce, the gateway uses `wc_order_{order_id}`; if your thank-you page also fires a browser `Purchase`, pass `{ eventID: "wc_order_123" }` to `fbq`. The gateway additionally ignores repeated webhook deliveries for the same order while the process is running.
+Meta deduplicates a browser and a server event when they share the same `event_name` and `event_id` (and arrive within its dedup window). The snippet creates one `event_id` and uses it for both. For WooCommerce, the gateway uses `wc_order_{order_id}`; if your thank-you page also fires a browser `Purchase`, pass `{ eventID: "wc_order_123" }` to `fbq`. For Shopify it is `shopify_order_{order_id}`. The gateway additionally ignores repeated webhook deliveries for the same order while the process is running.
 
 ## WooCommerce
 
@@ -118,6 +122,18 @@ Meta deduplicates a browser and a server event when they share the same `event_n
 4. Topic: choose **Order updated** (or a custom `order.completed` action if your setup provides one). The gateway only emits a `Purchase` when the order `status` is `completed`, regardless of topic.
 
 Signatures are verified as base64 HMAC-SHA256 of the raw request body in `X-WC-Webhook-Signature`, using a constant-time comparison. Value is the order `total` (it includes shipping and tax). Billing email, phone, name, city, state, postcode and country are hashed; `customer_ip_address`, `customer_user_agent` and `_fbp`/`_fbc` order meta (if a plugin stores them) are used when present.
+
+## Shopify
+
+1. In the Shopify admin go to **Settings > Notifications > Webhooks** (or register the webhooks from your app).
+2. Create webhooks in JSON format for **Order payment** (`orders/paid`) and, for cash-on-delivery stores, **Order creation** (`orders/create`). URL: `https://capi.example.com/webhooks/shopify`.
+3. Copy the signing secret shown under the webhook list (or your app's client secret) into `SHOPIFY_WEBHOOK_SECRET`.
+
+Signatures are verified as base64 HMAC-SHA256 of the raw body in `X-Shopify-Hmac-Sha256`, using a constant-time comparison. Topics other than `orders/create`, `orders/paid` and `orders/updated` are acknowledged with `200` and ignored, so Shopify does not keep retrying them.
+
+A `Purchase` is emitted only when `financial_status` is listed in `SHOPIFY_FINANCIAL_STATUSES` (default `paid`). Cash-on-delivery orders arrive as `pending`; set `SHOPIFY_FINANCIAL_STATUSES=paid,pending` to count them at order time. Cancelled orders and Shopify test orders are skipped (set `SHOPIFY_INCLUDE_TEST_ORDERS=true` while testing). Each order is forwarded once per process, even when it arrives through several topics or retries; Meta's own deduplication on `event_id` covers restarts.
+
+Value is `total_price` in the shop currency (it includes shipping and tax). The order email (or customer email), phone, billing name, city, province code, zip and country code are hashed, falling back to the shipping address and customer record. `customer.id` becomes `external_id`; `browser_ip` and `client_details.user_agent` are passed unhashed; `_fbp`/`_fbc` cart or note attributes are used when your theme stores them. Content ids are the line item SKU, falling back to the variant id and then the product id: make sure they match the ids in your Meta catalog. `event_source_url` is `SITE_URL/checkout/`, or the `.myshopify.com` domain from `X-Shopify-Shop-Domain` when `SITE_URL` is unset.
 
 ## Reliability and operations
 
@@ -149,6 +165,7 @@ Meta's documentation could not be fetched automatically while building this proj
 - exact list of transient error codes treated as retryable (`1, 2, 4, 17, 32, 341, 613`)
 - `fbc` format `fb.1.<ms timestamp>.<fbclid>` and normalization of `st`/`zp` for non-US regions
 - WooCommerce webhook topic names offered by your WooCommerce version
+- Shopify webhook payload fields (`total_price`, `financial_status`, `browser_ip`, `client_details`) for the Admin API version your webhooks use
 
 ## Development
 
@@ -173,6 +190,8 @@ Tests mock `fetch` and never contact Meta. See [CONTRIBUTING.md](CONTRIBUTING.md
 **বাংলাদেশি ফোন নম্বর:** `01712345678`, `+880 1712-345678`, `8801712345678` সবই `8801712345678` হয়ে হ্যাশ হয়। অন্য দেশের কোড ডিফল্ট করতে `DEFAULT_PHONE_COUNTRY_CODE` বদলান।
 
 **WooCommerce:** WooCommerce > Settings > Advanced > Webhooks-এ Delivery URL `https://আপনার-ডোমেইন/webhooks/woocommerce` দিন এবং Secret হিসেবে `WOOCOMMERCE_WEBHOOK_SECRET`-এর মান দিন। অর্ডারের স্ট্যাটাস `completed` হলে `Purchase` ইভেন্ট (মূল্য, কারেন্সি ও পণ্যসহ) যায়।
+
+**Shopify:** Settings > Notifications > Webhooks-এ JSON ফরম্যাটে `orders/paid` (ক্যাশ অন ডেলিভারি হলে `orders/create`-ও) ওয়েবহুক তৈরি করুন, URL দিন `https://আপনার-ডোমেইন/webhooks/shopify` এবং সাইনিং সিক্রেট `SHOPIFY_WEBHOOK_SECRET`-এ দিন। ডিফল্টে শুধু `paid` অর্ডার `Purchase` হিসেবে যায়; ক্যাশ অন ডেলিভারি অর্ডার গুনতে `SHOPIFY_FINANCIAL_STATUSES=paid,pending` দিন।
 
 **গোপনীয়তা:** যেখানে আইনে প্রয়োজন, শুধু সম্মতি দেওয়া ব্যবহারকারীর ইভেন্ট পাঠান (`data-require-consent="true"` ও `capi.consent(true)`)। হ্যাশ করা তথ্যও ব্যক্তিগত তথ্য হিসেবে গণ্য হতে পারে, তাই শুধু প্রয়োজনীয় ফিল্ড পাঠান এবং dead-letter ফাইল সুরক্ষিত রাখুন। প্রোডাকশনে চালানোর আগে উপরের "Facts to verify" তালিকা Meta-র সর্বশেষ ডকুমেন্টেশনের সঙ্গে মিলিয়ে নিন।
 

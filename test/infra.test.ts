@@ -115,6 +115,20 @@ describe("loadConfig", () => {
     });
     expect(c.testEventCode).toBeUndefined();
     expect(c.wooSecret).toBeUndefined();
+    expect(c.shopifySecret).toBeUndefined();
+    expect(c.shopifyFinancialStatuses).toEqual(["paid"]);
+    expect(c.shopifyIncludeTestOrders).toBe(false);
+  });
+  it("parses Shopify settings", () => {
+    const c = loadConfig({
+      ...base,
+      SHOPIFY_WEBHOOK_SECRET: " shpss_placeholder ",
+      SHOPIFY_FINANCIAL_STATUSES: " Paid, pending ,paid,",
+      SHOPIFY_INCLUDE_TEST_ORDERS: "true",
+    });
+    expect(c.shopifySecret).toBe("shpss_placeholder");
+    expect(c.shopifyFinancialStatuses).toEqual(["paid", "pending"]);
+    expect(c.shopifyIncludeTestOrders).toBe(true);
   });
   it("requires numeric PIXEL_ID and ACCESS_TOKEN", () => {
     expect(() => loadConfig({ ACCESS_TOKEN: "t" })).toThrow(ConfigError);
@@ -143,6 +157,8 @@ describe("loadConfig", () => {
     ["LOG_LEVEL", "loud"],
     ["DEFAULT_PHONE_COUNTRY_CODE", "+880"],
     ["ALLOW_MISSING_ORIGIN", "maybe"],
+    ["SHOPIFY_FINANCIAL_STATUSES", "paid,shipped"],
+    ["SHOPIFY_INCLUDE_TEST_ORDERS", "sometimes"],
   ])("rejects %s=%s", (k, v) => {
     expect(() => loadConfig({ ...base, [k]: v })).toThrow(ConfigError);
   });

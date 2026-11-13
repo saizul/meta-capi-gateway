@@ -20,6 +20,9 @@ export interface Config {
   logLevel: "debug" | "info" | "warn" | "error";
   wooSecret?: string;
   siteUrl?: string;
+  shopifySecret?: string;
+  shopifyFinancialStatuses: string[];
+  shopifyIncludeTestOrders: boolean;
   maxBodyBytes: number;
 }
 
@@ -43,6 +46,19 @@ function bool(env: Env, key: string, def: boolean): boolean {
   if (["1", "true", "yes", "on"].includes(raw)) return true;
   if (["0", "false", "no", "off"].includes(raw)) return false;
   throw new ConfigError(`${key} must be true or false`);
+}
+
+const SHOPIFY_STATUSES = ["pending", "authorized", "partially_paid", "paid", "partially_refunded", "refunded", "voided"];
+
+function shopifyStatuses(raw: string | undefined): string[] {
+  const list = (raw ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (list.length === 0) return ["paid"];
+  const bad = list.find((s) => !SHOPIFY_STATUSES.includes(s));
+  if (bad) throw new ConfigError(`SHOPIFY_FINANCIAL_STATUSES contains unknown status "${bad}"`);
+  return [...new Set(list)];
 }
 
 export function loadConfig(env: Env = process.env): Config {
@@ -85,9 +101,12 @@ export function loadConfig(env: Env = process.env): Config {
     defaultPhoneCountryCode: cc,
     logLevel: level,
     maxBodyBytes: int(env, "MAX_BODY_BYTES", 65_536, 1024, 10_000_000),
+    shopifyFinancialStatuses: shopifyStatuses(env.SHOPIFY_FINANCIAL_STATUSES),
+    shopifyIncludeTestOrders: bool(env, "SHOPIFY_INCLUDE_TEST_ORDERS", false),
   };
   if (env.TEST_EVENT_CODE?.trim()) cfg.testEventCode = env.TEST_EVENT_CODE.trim();
   if (env.WOOCOMMERCE_WEBHOOK_SECRET?.trim()) cfg.wooSecret = env.WOOCOMMERCE_WEBHOOK_SECRET.trim();
+  if (env.SHOPIFY_WEBHOOK_SECRET?.trim()) cfg.shopifySecret = env.SHOPIFY_WEBHOOK_SECRET.trim();
   if (env.SITE_URL?.trim()) cfg.siteUrl = env.SITE_URL.trim().replace(/\/+$/, "");
   return cfg;
 }
